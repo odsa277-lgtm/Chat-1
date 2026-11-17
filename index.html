@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Online chat</title>
+<style>
+  :root{
+    --bg:#eef1ee; --panel:#ffffff; --ink:#1d2a24; --muted:#6b7a72;
+    --mine:#1f6b4f; --mine-ink:#ffffff; --other:#e3e9e5; --line:#d5ddd8; --danger:#c0392b;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#141a17; --panel:#1c2420; --ink:#e6eee9; --muted:#8fa097;
+      --mine:#2e8f69; --other:#2a342f; --line:#2f3a35; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);display:flex;justify-content:center}
+  .app{width:100%;max-width:720px;height:100%;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}
+  header h1{font-size:18px;margin:0}
+  header small{color:var(--muted);display:block;font-size:12px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#aaa;margin-right:6px}
+  .dot.on{background:#2fb36d}
+  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:8px 14px}
+  .btn{background:var(--mine);color:var(--mine-ink)}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn.admin-on{background:var(--danger);color:#fff}
+  #list{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px}
+  .msg{max-width:80%;padding:8px 12px;border-radius:14px;background:var(--other);align-self:flex-start;overflow-wrap:anywhere}
+  .msg.mine{background:var(--mine);color:var(--mine-ink);align-self:flex-end}
+  .msg .meta{font-size:12px;opacity:.75;margin-bottom:2px}
+  .msg .row{display:flex;gap:8px;align-items:flex-start}
+  .msg .del{background:var(--danger);color:#fff;padding:2px 8px;font-size:12px;border-radius:6px;flex-shrink:0}
+  .empty{margin:auto;color:var(--muted);text-align:center}
+  form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}
+  input[type=text]{flex:1;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-width:0}
+  #nick{flex:0 0 120px}
+  :focus-visible{outline:2px solid var(--mine);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div><h1>Online chat</h1><small><span id="dot" class="dot"></span><span id="status">Ulanmoqda…</span></small></div>
+    <button id="adminBtn" class="btn ghost" type="button">Admin panel</button>
+  </header>
+  <div id="list" aria-live="polite"></div>
+  <form id="form" autocomplete="off">
+    <input id="nick" type="text" placeholder="Ismingiz" maxlength="20" required>
+    <input id="text" type="text" placeholder="Xabar yozing…" maxlength="500" required>
+    <button class="btn" type="submit">Yuborish</button>
+  </form>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+/* ===== SOZLAMALAR ===== */
+const ADMIN_PASSWORD = "gold9999";
+// Hamma shu xonaga ulanadi. Boshqa chat kerak bo'lsa, nomni o'zgartiring (noyob bo'lsin).
+const ROOM = "gold9999-online-chat-room-1";
+const BROKER = "wss://broker.hivemq.com:8884/mqtt";   // bepul ochiq server, ro'yxatdan o'tish shart emas
+/* ====================== */
+
+const $ = id => document.getElementById(id);
+const listEl = $("list"), statusEl = $("status"), dotEl = $("dot"), adminBtn = $("adminBtn");
+const TOPIC = "chat/" + ROOM;
+
+const uid = localStorage.getItem("chat_uid") || Math.random().toString(36).slice(2) + Date.now().toString(36);
+localStorage.setItem("chat_uid", uid);
+$("nick").value = localStorage.getItem("chat_nick") || "";
+
+let isAdmin = false;
+let msgs = {};            // id -> {id,name,text,uid,time}
+let deleted = {};         // id -> true (o'chirilganlar)
+const peers = {};         // uid -> oxirgi ko'ringan vaqt
+try {
+  msgs = JSON.parse(localStorage.getItem("chat_msgs") || "{}");
+  deleted = JSON.parse(localStorage.getItem("chat_deleted") || "{}");
+} catch {}
+
+function save() {
+  const ids = Object.keys(msgs).sort((a,b)=>msgs[a].time-msgs[b].time).slice(-300);
+  const keep = {}; ids.forEach(i => keep[i] = msgs[i]);
+  msgs = keep;
+  try {
+    localStorage.setItem("chat_msgs", JSON.stringify(msgs));
+    localStorage.setItem("chat_deleted", JSON.stringify(deleted));
+  } catch {}
+}
+
+function addMsg(m) {
+  if (!m || !m.id || deleted[m.id] || msgs[m.id]) return;
+  msgs[m.id] = { id: m.id, name: String(m.name||"").slice(0,20), text: String(m.text||"").slice(0,500), uid: m.uid, time: +m.time || Date.now() };
+}
+function delMsg(id) { deleted[id] = true; delete msgs[id]; }
+
+function render() {
+  const ids = Object.keys(msgs).sort((a,b)=>msgs[a].time-msgs[b].time);
+  const near = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 80;
+  listEl.innerHTML = "";
+  if (!ids.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "Hozircha xabar yo'q. Birinchi bo'lib yozing."; listEl.appendChild(e); return;
+  }
+  for (const id of ids) {
+    const m = msgs[id];
+    const el = document.createElement("div"); el.className = "msg" + (m.uid === uid ? " mine" : "");
+    const meta = document.createElement("div"); meta.className = "meta";
+    meta.textContent = (m.name || "Noma'lum") + " · " + new Date(m.time).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+    const row = document.createElement("div"); row.className = "row";
+    const t = document.createElement("div"); t.textContent = m.text; row.appendChild(t);
+    if (isAdmin) {
+      const d = document.createElement("button"); d.className = "del"; d.type = "button"; d.textContent = "O'chirish";
+      d.onclick = () => { delMsg(id); send({ t: "del", id }); save(); render(); };
+      row.appendChild(d);
+    }
+    el.append(meta, row); listEl.appendChild(el);
+  }
+  if (near) listEl.scrollTop = listEl.scrollHeight;
+}
+
+function updateStatus(connected) {
+  const now = Date.now();
+  const online = Object.values(peers).filter(t => now - t < 25000).length + 1;
+  dotEl.classList.toggle("on", connected);
+  statusEl.textContent = connected ? "Onlayn: " + online : "Ulanmoqda…";
+}
+
+/* ---------- Tarmoq (MQTT, o'yinlardagi kabi real vaqt) ---------- */
+const client = mqtt.connect(BROKER, { clientId: "c_" + uid + "_" + Math.random().toString(16).slice(2,6), reconnectPeriod: 2000 });
+let connected = false, syncSeen = false;
+
+function send(obj) {
+  if (!client.connected) return;
+  client.publish(TOPIC, JSON.stringify({ ...obj, uid }));
+}
+
+client.on("connect", () => {
+  connected = true; updateStatus(true);
+  client.subscribe(TOPIC);
+  send({ t: "hello" });
+  send({ t: "ping" });
+});
+client.on("close", () => { connected = false; updateStatus(false); });
+
+client.on("message", (_, payload) => {
+  let d; try { d = JSON.parse(payload.toString()); } catch { return; }
+  if (!d || typeof d !== "object") return;
+  if (d.uid && d.uid !== uid) peers[d.uid] = Date.now();
+
+  if (d.t === "msg") { if (d.uid !== uid || !msgs[d.id]) addMsg(d); save(); render(); }
+  else if (d.t === "del") { delMsg(d.id); save(); render(); }
+  else if (d.t === "hello" && d.uid !== uid) {
+    // Yangi kirgan odamga tarixni yuboramiz (bir nechta odam javob bermasligi uchun tasodifiy kutamiz)
+    syncSeen = false;
+    setTimeout(() => {
+      if (!syncSeen && (Object.keys(msgs).length || Object.keys(deleted).length)) {
+        const recent = Object.values(msgs).sort((a,b)=>a.time-b.time).slice(-100);
+        send({ t: "sync", msgs: recent, deleted: Object.keys(deleted).slice(-300), to: d.uid });
+      }
+    }, 100 + Math.random() * 1500);
+  }
+  else if (d.t === "sync") {
+    syncSeen = true;
+    if (d.to && d.to !== uid) return;
+    (d.deleted || []).forEach(id => { deleted[id] = true; delete msgs[id]; });
+    (d.msgs || []).forEach(addMsg);
+    save(); render();
+  }
+  updateStatus(connected);
+});
+
+setInterval(() => { send({ t: "ping" }); updateStatus(connected); }, 10000);
+
+/* ---------- Yuborish ---------- */
+$("form").addEventListener("submit", e => {
+  e.preventDefault();
+  const name = $("nick").value.trim().slice(0,20), text = $("text").value.trim().slice(0,500);
+  if (!name || !text) return;
+  if (!client.connected) { alert("Hali ulanmagan. Biroz kuting."); return; }
+  localStorage.setItem("chat_nick", name);
+  const m = { id: Date.now().toString(36) + Math.random().toString(36).slice(2,7), name, text, time: Date.now() };
+  addMsg({ ...m, uid });
+  send({ t: "msg", ...m });
+  save(); render();
+  $("text").value = "";
+  listEl.scrollTop = listEl.scrollHeight;
+});
+
+/* ---------- Admin panel ---------- */
+adminBtn.addEventListener("click", () => {
+  if (isAdmin) { isAdmin = false; adminBtn.textContent = "Admin panel"; adminBtn.className = "btn ghost"; render(); return; }
+  const p = prompt("Admin parolini kiriting:");
+  if (p === null) return;
+  if (p === ADMIN_PASSWORD) { isAdmin = true; adminBtn.textContent = "Admindan chiqish"; adminBtn.className = "btn admin-on"; render(); }
+  else alert("Parol noto'g'ri.");
+});
+
+render();
+</script>
+</body>
+</html>
